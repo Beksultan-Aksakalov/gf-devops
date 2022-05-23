@@ -1,0 +1,157 @@
+image: maven:3.6-openjdk-8
+
+variables:
+  IMAGE_NAME: $CI_REGISTRY_IMAGE:$CI_COMMIT_REF_SLUG
+  IMAGE_LATEST: $CI_REGISTRY_IMAGE:latest
+
+  DOCKER_HOST: tcp://localhost:2375
+  DOCKER_DRIVER: overlay2
+  DOCKER_TLS_CERTDIR: ""
+  DOCKER_MIRROR: "https://docker-nexus-mirror.apps.bcc.kz"
+
+  MAVEN_OPTS: "-Dmaven.repo.local=$CI_PROJECT_DIR/.m2/repository"
+
+cache:
+  untracked: true
+  key: ${CI_PROJECT_ID}
+  paths:
+    - ~/.m2/repository
+
+stages:
+  - lint
+  - build
+  - docker
+  - release
+  - deploy
+
+.maven_before: &maven_before
+  - curl https://nexus.apps.bcc.kz/repository/raw-devops-scripts/maven-settings-linux.xml -o ./settings.xml
+  - mvn clean install -s settings.xml -P linux
+
+.docker_before: &docker_before
+  - mkdir -p $HOME/.docker/ && echo $PROXY_CONFIG > $HOME/.docker/config.json
+  - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+  - docker login -u $DOCKERHUB_LOGIN -p $DOCKERHUB_PWD
+
+code-quality:
+  stage: lint
+  allow_failure: true
+  before_script:
+    - *maven_before
+  script:
+    - PROJECT_NAMESPACE=omni-channel-front
+    - PROJECT_NAME=$(mvn -s settings.xml help:evaluate -Dexpression=project.name -q -DforceStdout)
+    - mvn clean verify sonar:sonar -s settings.xml -Dsonar.projectName=$PROJECT_NAMESPACE-$PROJECT_NAME
+
+build:maven:
+  stage: build
+  before_script:
+    - *maven_before
+  script:
+    - mvn package -s settings.xml -P linux
+  artifacts:
+    name: "$CI_PROJECT_NAME-$CI_BUILD_ID-$CI_BUILD_REF"
+    expire_in: 1 week
+    paths:
+      - target/lib/*
+      - target/*-runner.jar
+
+build:docker:
+  stage: docker
+  image: docker:stable
+  services:
+    - name: docker:19.03.13-dind
+      command: [ "--registry-mirror", "https://docker-nexus-mirror.apps.bcc.kz" ]
+  before_script:
+    - *docker_before
+  script:
+    - docker build --cache-from $IMAGE_LATEST -t $IMAGE_NAME  .
+    - docker push $IMAGE_NAME
+
+release:
+  stage: release
+  image: docker:stable
+  only:
+    - /^release-v.*$/i
+  services:
+    - name: docker:19.03.13-dind
+      command: [ "--registry-mirror", "https://docker-nexus-mirror.apps.bcc.kz" ]
+  before_script:
+    - *docker_before
+  script:
+    - docker pull $IMAGE_NAME
+    - docker tag $IMAGE_NAME $IMAGE_LATEST
+    - docker push $IMAGE_LATEST
+    - docker tag $IMAGE_NAME ${CI_REGISTRY_IMAGE}:${CI_COMMIT_TAG}
+    - docker push ${CI_REGISTRY_IMAGE}:${CI_COMMIT_TAG}
+
+.base_deploy: &base_deploy
+  stage: deploy
+  image: registry.apps.bcc.kz/infrastructure/alpine-git-yq:v1.0.0
+  interruptible: true
+  only:
+    - develop
+  before_script:
+    - mkdir -p ~/.ssh
+    - ssh-keyscan -p 3022 ssh.gitlab.apps.bcc.kz > ~/.ssh/known_hosts
+    - eval $(ssh-agent -s)
+    - echo "$GITLAB_CI_DEPLOY_PRIVATE_KEY" > ~/.ssh/id_rsa
+    - chmod 400 ~/.ssh/id_rsa
+    - ssh-add ~/.ssh/id_rsa
+    - ssh -T git@ssh.gitlab.apps.bcc.kz -p 3022
+    - git config --global user.email "devops@bcc.kz"
+    - git config --global user.name "DevOps"
+    - export BCC_PROJECT_NAME=$(echo $CI_PROJECT_NAME | tr . -)
+    - git clone ssh://git@ssh.gitlab.apps.bcc.kz:3022/omni-channel-front/gf-helm-charts/$BCC_PROJECT_NAME.git
+    - cd $BCC_PROJECT_NAME
+  script:
+    - git checkout $BCC_ENVIRONMENT
+    - bcc-helm-helper --file ${BCC_HELM_VALUES} --tag ${CI_COMMIT_REF_SLUG} --hash ${CI_COMMIT_SHORT_SHA}
+    - git add .
+    - git commit -m "Deploy to ${BCC_ENVIRONMENT}, Image ${CI_COMMIT_REF_SLUG}, Hash ${CI_COMMIT_SHORT_SHA}, Commit ${CI_COMMIT_TITLE}"
+    - git push origin $BCC_ENVIRONMENT
+
+Deploy Development:
+  <<: *base_deploy
+  only:
+    - develop
+  variables:
+    BCC_ENVIRONMENT: develop
+    BCC_HELM_VALUES: values-development.yaml
+
+Deploy Production:
+  <<: *base_deploy
+  when: manual
+  only:
+    - /^release-v.*$/i
+  variables:
+    BCC_ENVIRONMENT: production
+    BCC_HELM_VALUES: values-production.yaml
+
+.base_old_deploy: &base_old_deploy
+  stage: deploy
+  image: registry.apps.bcc.kz/infrastructure/base-images/alpine:v3.13.1
+  interruptible: true
+  script:
+    - curl --location --request POST "${CI_API_V4_URL}/projects/${HELM_PROJECT_ID}/trigger/pipeline"
+        --header "Content-Type':' application/x-www-form-urlencoded"
+        --data-urlencode "token=${HELM_TRIGGER_TOKEN}"
+        --data-urlencode "ref=${BCC_ENV}"
+        --data-urlencode "variables[BCC_PROJECT]=${CI_PROJECT_NAME}"
+        --data-urlencode "variables[BCC_IMAGE_TAG]=${CI_COMMIT_REF_SLUG}"
+        --data-urlencode "variables[BCC_IMAGE_HASH]=${CI_COMMIT_SHORT_SHA}"
+
+Deploy to OLD Development:
+  <<: *base_old_deploy
+  only:
+    - develop
+  variables:
+    BCC_ENV: develop
+
+Deploy to OLD Production:
+  <<: *base_old_deploy
+  when: manual
+  only:
+    - /^release-v.*$/i
+  variables:
+    BCC_ENV: production

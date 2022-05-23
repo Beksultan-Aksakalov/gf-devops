@@ -1,0 +1,133 @@
+
+variables:
+  PROXY_CONFIG: '{"proxies": {"default": {"httpProxy": "$HTTP_PROXY", "httpsProxy": "$HTTPS_PROXY", "noProxy": "$NO_PROXY"}}}'
+  IMAGE_NAME: $CI_REGISTRY_IMAGE:$CI_COMMIT_REF_SLUG
+
+  DOCKER_HOST: tcp://localhost:2375
+  DOCKER_DRIVER: overlay2
+  DOCKER_TLS_CERTDIR: ""
+  DOCKER_MIRROR: "https://docker-nexus-mirror.apps.bcc.kz"
+
+cache:
+  key: ${CI_PROJECT_ID}
+  paths:
+    - node_modules/
+
+stages:
+  - lint
+  - build-docker
+  - release
+  - deploy
+
+.project_before: &project_before
+  - PROJECT_NAMESPACE=omni-channel-front
+  - PROJECT_NAME=$(grep 'name' package.json | cut -d '"' -f4 | tr -d '[[:space:]]')
+  - PROJECT_VERSION=$(grep 'version' package.json | cut -d '"' -f4 | tr -d '[[:space:]]')
+
+.docker_before: &docker_before
+  - mkdir -p $HOME/.docker/ && echo $PROXY_CONFIG > $HOME/.docker/config.json
+  - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+  - docker login -u $DOCKERHUB_LOGIN -p $DOCKERHUB_PWD
+
+code-quality:
+  stage: lint
+  image:
+    name: sonarsource/sonar-scanner-cli:latest
+    entrypoint: [""]
+  allow_failure: true
+  before_script:
+    - *project_before
+  script:
+    - rm sonar-project.properties
+    - wget -Y off https://nexus.apps.bcc.kz/repository/raw-devops-scripts/sonarqube/omni-channel-front/nodejs/sonar-project.properties
+    - sonar-scanner
+      -Dsonar.projectKey=$PROJECT_NAMESPACE-$PROJECT_NAME
+      -Dsonar.projectName=$PROJECT_NAMESPACE-$PROJECT_NAME
+      -Dsonar.projectVersion=$PROJECT_VERSION
+      -Dsonar.gitlab.commit_sha=$CI_COMMIT_SHA
+      -Dsonar.gitlab.ref_name=$CI_COMMIT_REF_NAME
+      -Dsonar.verbose=true
+      -Dsonar.qualitygate.wait=true
+
+build-docker:
+  stage: build-docker
+  image: docker:stable
+  services:
+    - name: docker:19.03.13-dind
+      command: [ "--registry-mirror", "https://docker-nexus-mirror.apps.bcc.kz" ]
+  cache:
+    untracked: true
+    key: ${CI_PROJECT_ID}
+    paths:
+      - /cache
+  before_script:
+    - *docker_before
+  script:
+    - docker build --cache-from $CI_REGISTRY_IMAGE:latest -t $IMAGE_NAME  .
+    - docker push $IMAGE_NAME
+
+release:
+  stage: release
+  image: docker:stable
+  only:
+    - /^release-v.*$/i
+  services:
+    - name: docker:19.03.13-dind
+      command: [ "--registry-mirror", "https://docker-nexus-mirror.apps.bcc.kz" ]
+  cache:
+    untracked: true
+    key: ${CI_PROJECT_ID}
+    paths:
+      - /cache
+  before_script:
+    - *project_before
+    - *docker_before
+  script:
+    - docker pull $IMAGE_NAME
+    - docker tag $IMAGE_NAME ${CI_REGISTRY_IMAGE}:latest
+    - docker push ${CI_REGISTRY_IMAGE}:latest
+    - docker tag $IMAGE_NAME ${CI_REGISTRY_IMAGE}:${PROJECT_VERSION}
+    - docker push ${CI_REGISTRY_IMAGE}:${PROJECT_VERSION}
+
+.base_deploy: &base_deploy
+  stage: deploy
+  image: registry.apps.bcc.kz/infrastructure/alpine-git-yq:v1.0.0
+  interruptible: true
+  only:
+    - develop
+  before_script:
+    - mkdir -p ~/.ssh
+    - ssh-keyscan -p 3022 ssh.gitlab.apps.bcc.kz > ~/.ssh/known_hosts
+    - eval $(ssh-agent -s)
+    - echo "$GITLAB_CI_DEPLOY_PRIVATE_KEY" > ~/.ssh/id_rsa
+    - chmod 400 ~/.ssh/id_rsa
+    - ssh-add ~/.ssh/id_rsa
+    - ssh -T git@ssh.gitlab.apps.bcc.kz -p 3022
+    - git config --global user.email "devops@bcc.kz"
+    - git config --global user.name "DevOps"
+    - export BCC_PROJECT_NAME=$(echo $CI_PROJECT_NAME | tr . -)
+    - git clone ssh://git@ssh.gitlab.apps.bcc.kz:3022/omni-channel-front/gf-helm-charts/$BCC_PROJECT_NAME.git
+    - cd $BCC_PROJECT_NAME
+  script:
+    - git checkout $BCC_ENVIRONMENT
+    - bcc-helm-helper --file ${BCC_HELM_VALUES} --tag ${CI_COMMIT_REF_SLUG} --hash ${CI_COMMIT_SHORT_SHA}
+    - git add .
+    - git commit -m "Deploy to ${BCC_ENVIRONMENT}, Image ${CI_COMMIT_REF_SLUG}, Hash ${CI_COMMIT_SHORT_SHA}, Commit ${CI_COMMIT_TITLE}"
+    - git push origin $BCC_ENVIRONMENT
+
+Deploy Development:
+  <<: *base_deploy
+  only:
+    - develop
+  variables:
+    BCC_ENVIRONMENT: develop
+    BCC_HELM_VALUES: values-development.yaml
+
+Deploy Production:
+  <<: *base_deploy
+  when: manual
+  only:
+    - /^release-v.*$/i
+  variables:
+    BCC_ENVIRONMENT: production
+    BCC_HELM_VALUES: values-production.yaml
